@@ -4,8 +4,10 @@ import dotenv from 'dotenv';
 import twilio from 'twilio';
 import { WebSocketServer } from 'ws';
 import http from 'http';
+import https from 'https';
 import { createClient } from '@deepgram/sdk';
 import { Readable } from 'stream';
+import https from 'https';
 
 dotenv.config();
 
@@ -157,16 +159,15 @@ app.post('/api/token', generateToken);
  * 2. Twilio makes POST request to this endpoint when call connects
  * 3. We extract the 'To' parameter (destination phone number)
  * 4. We return TwiML that:
- *    - Says a greeting
  *    - Dials the destination number
- *    - Streams audio to our WebSocket server
+ *    - Records the call (both sides)
+ *    - Calls /api/recording-complete when recording is done
  */
 app.post('/api/voice', (req, res) => {
   try {
     console.log('📞 TwiML request received');
     console.log('   Request body:', JSON.stringify(req.body, null, 2));
     console.log('   Request query:', JSON.stringify(req.query, null, 2));
-    console.log('   Request headers:', JSON.stringify(req.headers, null, 2));
     
     const twiml = new twilio.twiml.VoiceResponse();
     
@@ -186,50 +187,31 @@ app.post('/api/voice', (req, res) => {
     
     console.log('📞 Dialing number:', toNumber);
     
-    // Get the Media Stream WebSocket URL
-    const streamUrl = process.env.MEDIA_STREAM_URL;
+    // Get the base URL for recording callback
+    // Priority: BACKEND_URL env var > Railway public domain > construct from request
+    const baseUrl = process.env.BACKEND_URL 
+      ? process.env.BACKEND_URL
+      : process.env.RAILWAY_PUBLIC_DOMAIN 
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+      : `${req.protocol}://${req.get('host')}`;
     
-    if (!streamUrl) {
-      console.warn('⚠️  MEDIA_STREAM_URL not set. Audio streaming will not work.');
-      console.warn('   For local dev, use ngrok: ngrok http 3001');
-      console.warn('   Then set MEDIA_STREAM_URL=wss://your-ngrok-url.ngrok.io/api/stream');
-      // Continue without streaming - call will still work
-    } else {
-      console.log('📡 Media Stream URL:', streamUrl);
-      
-      // Validate stream URL format
-      if (!streamUrl.startsWith('wss://') && !streamUrl.startsWith('ws://')) {
-        console.error('❌ Invalid MEDIA_STREAM_URL format. Must start with wss:// or ws://');
-        console.error('   Current value:', streamUrl);
-      } else {
-        // Start streaming the call audio via WebSocket
-        // This must be called BEFORE <Dial> to capture both sides of the conversation
-        try {
-          twiml.start()
-            .stream({ 
-              url: streamUrl,
-              track: 'both_tracks' // Track both inbound (browser) and outbound (phone) audio
-            });
-          console.log('✅ Stream directive added to TwiML');
-        } catch (streamError) {
-          console.error('❌ Error adding stream directive:', streamError);
-          // Continue without streaming
-        }
-      }
-    }
+    const recordingCallbackUrl = `${baseUrl}/api/recording-complete`;
+    console.log('📹 Recording callback URL:', recordingCallbackUrl);
     
-    // Dial the destination number
-    // This connects the browser call to the actual phone number
+    // Dial the destination number with recording enabled
+    // record-from-answer-dual records both sides of the conversation
     try {
       const dial = twiml.dial({
         callerId: twilioPhoneNumber, // Use your Twilio phone number as caller ID
-        record: 'false', // Set to 'record-from-answer' if you want to record
+        record: 'record-from-answer-dual', // Record both sides after answer
+        recordingStatusCallback: recordingCallbackUrl, // Callback when recording is complete
+        recordingStatusCallbackMethod: 'POST',
         timeout: 30, // Wait up to 30 seconds for answer
         action: undefined, // No action URL needed for simple dial
       });
       
       dial.number(toNumber);
-      console.log('✅ Dial directive added to TwiML');
+      console.log('✅ Dial directive added to TwiML with recording enabled');
     } catch (dialError) {
       console.error('❌ Error adding dial directive:', dialError);
       twiml.say('Sorry, there was an error connecting your call.');
@@ -270,7 +252,201 @@ app.get('/api/voice', (req, res) => {
 });
 
 /**
+ * Recording completion callback endpoint
+ * Twilio calls this when a recording is complete
+ * 
+ * This endpoint:
+ * 1. Receives RecordingUrl from Twilio
+ * 2. Downloads the recording file
+ * 3. Sends to Deepgram for transcription
+ * 4. Logs/returns the transcript
+ */
+app.post('/api/recording-complete', async (req, res) => {
+  try {
+    console.log('📹 Recording completion callback received');
+    console.log('   Request body:', JSON.stringify(req.body, null, 2));
+    
+    const recordingUrl = req.body.RecordingUrl;
+    const recordingSid = req.body.RecordingSid;
+    const callSid = req.body.CallSid;
+    const recordingStatus = req.body.RecordingStatus;
+    const recordingDuration = req.body.RecordingDuration;
+    
+    if (!recordingUrl) {
+      console.error('❌ No RecordingUrl in callback');
+      return res.status(400).json({ error: 'RecordingUrl is required' });
+    }
+    
+    console.log('📥 Recording details:');
+    console.log(`   Recording SID: ${recordingSid}`);
+    console.log(`   Call SID: ${callSid}`);
+    console.log(`   Status: ${recordingStatus}`);
+    console.log(`   Duration: ${recordingDuration} seconds`);
+    console.log(`   URL: ${recordingUrl}`);
+    
+    // Send acknowledgment to Twilio immediately
+    res.status(200).json({ status: 'received' });
+    
+    // Process recording asynchronously
+    processRecording(recordingUrl, recordingSid, callSid).catch(error => {
+      console.error('❌ Error processing recording:', error);
+    });
+    
+  } catch (error) {
+    console.error('❌ Error in recording callback:', error);
+    // Still return 200 to Twilio to avoid retries
+    res.status(200).json({ error: error.message });
+  }
+});
+
+/**
+ * Download recording and transcribe with Deepgram
+ */
+async function processRecording(recordingUrl, recordingSid, callSid) {
+  try {
+    console.log('🔄 Processing recording...');
+    
+    if (!deepgramApiKey) {
+      console.warn('⚠️  Deepgram API key not configured. Skipping transcription.');
+      return;
+    }
+    
+    // Download the recording file
+    console.log('📥 Downloading recording from Twilio...');
+    const recordingBuffer = await downloadFile(recordingUrl);
+    console.log(`✅ Downloaded recording: ${recordingBuffer.length} bytes`);
+    
+    // Initialize Deepgram client
+    const deepgramClient = createClient(deepgramApiKey);
+    
+    // Create a readable stream from the buffer
+    const audioStream = Readable.from(recordingBuffer);
+    
+    // Transcribe with Deepgram
+    // Twilio recordings are typically WAV format, but we'll let Deepgram auto-detect
+    console.log('📤 Sending recording to Deepgram for transcription...');
+    const { result, error } = await deepgramClient.listen.prerecorded.transcribeFile(
+      audioStream,
+      {
+        model: 'nova-2',
+        language: 'nl', // Dutch
+        punctuate: true,
+        // Let Deepgram auto-detect the format
+      }
+    ).catch(err => {
+      console.error('❌ Deepgram API promise rejection:', err);
+      return { result: null, error: err };
+    });
+    
+    if (error) {
+      console.error('❌ Deepgram transcription error:', error);
+      console.error('   Error code:', error.code);
+      console.error('   Error message:', error.message);
+      return;
+    }
+    
+    if (result) {
+      console.log('✅ Deepgram transcription complete');
+      
+      // Extract transcripts
+      const channels = result.results?.channels || [];
+      const transcripts = [];
+      
+      channels.forEach((channel, index) => {
+        const alternatives = channel.alternatives || [];
+        alternatives.forEach(alt => {
+          if (alt.transcript) {
+            const transcriptEntry = {
+              text: alt.transcript,
+              confidence: alt.confidence || 0,
+              words: alt.words || [],
+              recordingSid: recordingSid,
+              callSid: callSid,
+              timestamp: new Date().toISOString(),
+            };
+            
+            transcripts.push(transcriptEntry);
+            
+            console.log(`📝 [TRANSCRIPT] "${alt.transcript}"`);
+            console.log(`   Confidence: ${(alt.confidence * 100).toFixed(1)}%`);
+            console.log(`   Words: ${alt.words?.length || 0}`);
+            
+            // Send transcript to frontend via WebSocket
+            broadcastTranscript({
+              text: alt.transcript,
+              confidence: alt.confidence || 0,
+              words: alt.words || [],
+              isFinal: true,
+              recordingSid: recordingSid,
+              callSid: callSid,
+            });
+          }
+        });
+      });
+      
+      console.log(`✅ Transcription complete: ${transcripts.length} transcript(s) extracted`);
+      return transcripts;
+    } else {
+      console.warn('⚠️  Deepgram returned no result');
+    }
+  } catch (error) {
+    console.error('❌ Exception during recording processing:', error);
+    console.error('   Error type:', error.constructor.name);
+    console.error('   Error message:', error.message);
+    console.error('   Error stack:', error.stack);
+    throw error;
+  }
+}
+
+/**
+ * Download a file from a URL
+ * For Twilio recordings, we need to add Basic Auth with Account SID and Auth Token
+ */
+function downloadFile(url) {
+  return new Promise((resolve, reject) => {
+    // Check if this is a Twilio URL (requires authentication)
+    const isTwilioUrl = url.includes('twilio.com');
+    
+    const options = {
+      headers: {}
+    };
+    
+    // Add Basic Auth for Twilio URLs
+    if (isTwilioUrl && accountSid && authToken) {
+      const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
+      options.headers['Authorization'] = `Basic ${auth}`;
+    }
+    
+    https.get(url, options, (response) => {
+      if (response.statusCode !== 200) {
+        reject(new Error(`Failed to download file: ${response.statusCode} ${response.statusMessage}`));
+        return;
+      }
+      
+      const chunks = [];
+      response.on('data', (chunk) => {
+        chunks.push(chunk);
+      });
+      
+      response.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        resolve(buffer);
+      });
+      
+      response.on('error', (error) => {
+        reject(error);
+      });
+    }).on('error', (error) => {
+      reject(error);
+    });
+  });
+}
+
+/**
  * WebSocket server for receiving audio stream from Twilio Media Streams
+ * 
+ * NOTE: Media Streams are currently disabled in favor of call recording.
+ * This code is kept for future use but not actively used.
  * 
  * Twilio Media Streams Protocol:
  * - Twilio connects to this WebSocket when <Stream> is executed in TwiML
