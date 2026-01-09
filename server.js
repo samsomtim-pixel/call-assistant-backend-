@@ -714,8 +714,19 @@ const transcriptWss = new WebSocketServer({
 const frontendClients = new Set();
 
 transcriptWss.on('connection', (ws, req) => {
+  const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const connectionStartTime = Date.now();
+  
+  console.log('📱 ========================================');
   console.log('📱 Frontend client connected for transcripts');
+  console.log(`   Client ID: ${clientId}`);
+  console.log(`   Request URL: ${req.url}`);
+  console.log(`   Request Method: ${req.method}`);
+  console.log(`   Request Headers:`, JSON.stringify(req.headers, null, 2));
+  console.log(`   WebSocket ready state: ${ws.readyState} (1 = OPEN)`);
   console.log(`   Total connected clients: ${frontendClients.size + 1}`);
+  console.log(`   Timestamp: ${new Date().toISOString()}`);
+  
   frontendClients.add(ws);
   
   // Send welcome message
@@ -724,25 +735,42 @@ transcriptWss.on('connection', (ws, req) => {
       type: 'connected',
       message: 'Connected to transcript stream'
     }));
-    console.log('   ✅ Welcome message sent to frontend');
+    console.log(`   ✅ Welcome message sent to frontend client ${clientId}`);
   } catch (error) {
-    console.error('   ❌ Error sending welcome message:', error);
+    console.error(`   ❌ Error sending welcome message to ${clientId}:`, error);
   }
   
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
+    const duration = ((Date.now() - connectionStartTime) / 1000).toFixed(2);
+    console.log('📱 ========================================');
     console.log('📱 Frontend client disconnected from transcript stream');
+    console.log(`   Client ID: ${clientId}`);
+    console.log(`   Close code: ${code}`);
+    console.log(`   Close reason: ${reason ? reason.toString() : 'none'}`);
+    console.log(`   Connection duration: ${duration}s`);
     console.log(`   Remaining clients: ${frontendClients.size - 1}`);
+    console.log(`   Timestamp: ${new Date().toISOString()}`);
     frontendClients.delete(ws);
   });
   
   ws.on('error', (error) => {
-    console.error('❌ Frontend WebSocket error:', error);
+    console.error('❌ ========================================');
+    console.error('❌ Frontend WebSocket error');
+    console.error(`   Client ID: ${clientId}`);
+    console.error(`   Error:`, error);
+    console.error(`   Error message: ${error?.message || 'unknown'}`);
+    console.error(`   Ready state: ${ws.readyState}`);
+    console.error(`   Timestamp: ${new Date().toISOString()}`);
     frontendClients.delete(ws);
   });
   
   ws.on('message', (data) => {
-    console.log('📥 Message received from frontend:', data.toString());
+    console.log(`📥 Message received from frontend client ${clientId}:`);
+    console.log(`   Data: ${data.toString()}`);
+    console.log(`   Data length: ${data.length || 0}`);
   });
+  
+  console.log(`✅ Frontend client ${clientId} fully registered`);
 });
 
 // Function to broadcast transcripts to all connected frontend clients
