@@ -303,57 +303,122 @@ app.post('/api/recording-complete', async (req, res) => {
  */
 async function processRecording(recordingUrl, recordingSid, callSid) {
   try {
+    console.log('🔄 ========================================');
     console.log('🔄 Processing recording...');
+    console.log(`   Recording SID: ${recordingSid}`);
+    console.log(`   Call SID: ${callSid}`);
+    console.log(`   Original URL: ${recordingUrl}`);
     
     if (!deepgramApiKey) {
       console.warn('⚠️  Deepgram API key not configured. Skipping transcription.');
       return;
     }
     
+    // Ensure we request WAV format from Twilio (add .wav extension if not present)
+    let downloadUrl = recordingUrl;
+    if (!recordingUrl.endsWith('.wav') && !recordingUrl.endsWith('.mp3')) {
+      // Twilio supports .wav format - append it to get WAV format
+      downloadUrl = recordingUrl.endsWith('/') 
+        ? `${recordingUrl}.wav`
+        : `${recordingUrl}.wav`;
+      console.log(`📝 Modified URL to request WAV format: ${downloadUrl}`);
+    } else {
+      console.log(`📝 Using original URL format: ${downloadUrl}`);
+    }
+    
     // Download the recording file
     console.log('📥 Downloading recording from Twilio...');
-    const recordingBuffer = await downloadFile(recordingUrl);
+    const recordingBuffer = await downloadFile(downloadUrl);
     console.log(`✅ Downloaded recording: ${recordingBuffer.length} bytes`);
+    console.log(`   Buffer type: ${recordingBuffer.constructor.name}`);
+    console.log(`   First 20 bytes (hex): ${Array.from(recordingBuffer.slice(0, 20)).map(b => '0x' + b.toString(16).padStart(2, '0')).join(' ')}`);
+    
+    // Check if buffer looks like WAV (should start with "RIFF")
+    const header = recordingBuffer.slice(0, 4).toString('ascii');
+    console.log(`   File header: "${header}" (expected "RIFF" for WAV)`);
     
     // Initialize Deepgram client
+    console.log('🔧 Initializing Deepgram client...');
     const deepgramClient = createClient(deepgramApiKey);
     
     // Create a readable stream from the buffer
     const audioStream = Readable.from(recordingBuffer);
+    console.log('✅ Created readable stream from buffer');
     
-    // Transcribe with Deepgram
-    // Twilio recordings are typically WAV format, but we'll let Deepgram auto-detect
+    // Prepare Deepgram options
+    const deepgramOptions = {
+      model: 'nova-2', // Better for phone audio
+      language: 'nl', // Dutch - explicitly set
+      punctuate: true,
+      // Let Deepgram auto-detect the format, but we're sending WAV
+    };
+    
+    console.log('📤 ========================================');
     console.log('📤 Sending recording to Deepgram for transcription...');
+    console.log('📤 Deepgram Options:');
+    console.log(JSON.stringify(deepgramOptions, null, 2));
+    console.log(`   Audio buffer size: ${recordingBuffer.length} bytes`);
+    console.log(`   Stream type: ${audioStream.constructor.name}`);
+    
+    const startTime = Date.now();
     const { result, error } = await deepgramClient.listen.prerecorded.transcribeFile(
       audioStream,
-      {
-        model: 'nova-2',
-        language: 'nl', // Dutch
-        punctuate: true,
-        // Let Deepgram auto-detect the format
-      }
+      deepgramOptions
     ).catch(err => {
       console.error('❌ Deepgram API promise rejection:', err);
+      console.error('   Error type:', err?.constructor?.name);
+      console.error('   Error message:', err?.message);
+      console.error('   Error code:', err?.code);
+      console.error('   Full error object:', JSON.stringify(err, null, 2));
       return { result: null, error: err };
     });
     
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    console.log(`⏱️  Deepgram API call completed in ${duration}s`);
+    
     if (error) {
-      console.error('❌ Deepgram transcription error:', error);
-      console.error('   Error code:', error.code);
-      console.error('   Error message:', error.message);
+      console.error('❌ ========================================');
+      console.error('❌ Deepgram transcription error:');
+      console.error('   Error type:', error?.constructor?.name);
+      console.error('   Error code:', error?.code);
+      console.error('   Error message:', error?.message);
+      console.error('   Full error object:', JSON.stringify(error, null, 2));
       return;
     }
     
     if (result) {
+      console.log('✅ ========================================');
       console.log('✅ Deepgram transcription complete');
+      console.log('📥 FULL Deepgram Response Object:');
+      console.log(JSON.stringify(result, null, 2));
+      console.log('📥 ========================================');
       
       // Extract transcripts
       const channels = result.results?.channels || [];
+      console.log(`📊 Found ${channels.length} channel(s) in response`);
+      
+      if (channels.length === 0) {
+        console.warn('⚠️  No channels found in Deepgram response!');
+        console.warn('   Response structure:', Object.keys(result));
+        if (result.results) {
+          console.warn('   Results structure:', Object.keys(result.results));
+        }
+      }
+      
       const transcripts = [];
       
       channels.forEach((channel, index) => {
+        console.log(`📊 Processing channel ${index}:`);
         const alternatives = channel.alternatives || [];
-        alternatives.forEach(alt => {
+        console.log(`   Found ${alternatives.length} alternative(s)`);
+        
+        alternatives.forEach((alt, altIndex) => {
+          console.log(`   Alternative ${altIndex}:`);
+          console.log(`     Has transcript: ${!!alt.transcript}`);
+          console.log(`     Transcript length: ${alt.transcript?.length || 0}`);
+          console.log(`     Confidence: ${alt.confidence || 'N/A'}`);
+          console.log(`     Words count: ${alt.words?.length || 0}`);
+          
           if (alt.transcript) {
             const transcriptEntry = {
               text: alt.transcript,
@@ -379,20 +444,27 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
               recordingSid: recordingSid,
               callSid: callSid,
             });
+          } else {
+            console.warn(`   ⚠️  Alternative ${altIndex} has no transcript!`);
+            console.warn(`   Alternative object:`, JSON.stringify(alt, null, 2));
           }
         });
       });
       
       console.log(`✅ Transcription complete: ${transcripts.length} transcript(s) extracted`);
+      console.log('🔄 ========================================');
       return transcripts;
     } else {
-      console.warn('⚠️  Deepgram returned no result');
+      console.warn('⚠️  Deepgram returned no result (result is null/undefined)');
+      console.warn('   This might indicate an issue with the API call');
     }
   } catch (error) {
-    console.error('❌ Exception during recording processing:', error);
+    console.error('❌ ========================================');
+    console.error('❌ Exception during recording processing:');
     console.error('   Error type:', error.constructor.name);
     console.error('   Error message:', error.message);
     console.error('   Error stack:', error.stack);
+    console.error('   Full error:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
     throw error;
   }
 }
