@@ -82,10 +82,15 @@ const twilioClient = twilio(accountSid, authToken);
  * - The token grants permission to make calls
  * - When Device.connect() is called, we pass a TwiML URL
  * - Twilio fetches that TwiML URL to get call instructions
+ * 
+ * Supports both GET and POST methods:
+ * - GET: identity can be passed as query parameter
+ * - POST: identity can be passed in request body
  */
-app.post('/api/token', async (req, res) => {
+const generateToken = async (req, res) => {
   try {
-    const { identity } = req.body; // Optional: user identity
+    // Support both GET (query param) and POST (body) for identity
+    const identity = req.body?.identity || req.query?.identity;
     
     console.log('🔑 Token request received');
     
@@ -137,7 +142,11 @@ app.post('/api/token', async (req, res) => {
       details: error.message 
     });
   }
-});
+};
+
+// Register both GET and POST endpoints
+app.get('/api/token', generateToken);
+app.post('/api/token', generateToken);
 
 /**
  * TwiML endpoint for outbound calls
