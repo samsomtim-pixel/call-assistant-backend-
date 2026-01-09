@@ -315,15 +315,21 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
     }
     
     // Ensure we request WAV format from Twilio (add .wav extension if not present)
+    // Try WAV first, fallback to MP3 if WAV parsing fails
     let downloadUrl = recordingUrl;
+    let useWav = true;
+    
     if (!recordingUrl.endsWith('.wav') && !recordingUrl.endsWith('.mp3')) {
       // Twilio supports .wav format - append it to get WAV format
       downloadUrl = recordingUrl.endsWith('/') 
         ? `${recordingUrl}.wav`
         : `${recordingUrl}.wav`;
       console.log(`📝 Modified URL to request WAV format: ${downloadUrl}`);
+    } else if (recordingUrl.endsWith('.mp3')) {
+      useWav = false;
+      console.log(`📝 Using MP3 format: ${downloadUrl}`);
     } else {
-      console.log(`📝 Using original URL format: ${downloadUrl}`);
+      console.log(`📝 Using original WAV URL format: ${downloadUrl}`);
     }
     
     // Download the recording file
@@ -333,9 +339,71 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
     console.log(`   Buffer type: ${recordingBuffer.constructor.name}`);
     console.log(`   First 20 bytes (hex): ${Array.from(recordingBuffer.slice(0, 20)).map(b => '0x' + b.toString(16).padStart(2, '0')).join(' ')}`);
     
+    // Parse WAV header to get audio format details
+    let audioFormat = null;
+    let sampleRate = null;
+    let channels = null;
+    let bitsPerSample = null;
+    let audioCodec = null;
+    
     // Check if buffer looks like WAV (should start with "RIFF")
     const header = recordingBuffer.slice(0, 4).toString('ascii');
     console.log(`   File header: "${header}" (expected "RIFF" for WAV)`);
+    
+    if (useWav && header === 'RIFF' && recordingBuffer.length >= 44) {
+      try {
+        // Parse WAV header (standard 44-byte header)
+        // Bytes 0-3: "RIFF"
+        // Bytes 4-7: File size
+        // Bytes 8-11: "WAVE"
+        // Bytes 12-15: "fmt "
+        // Bytes 16-19: Subchunk1Size (usually 16)
+        // Bytes 20-21: AudioFormat (1 = PCM, 6 = mulaw, 7 = alaw)
+        // Bytes 22-23: NumChannels (1 = mono, 2 = stereo)
+        // Bytes 24-27: SampleRate
+        // Bytes 28-31: ByteRate
+        // Bytes 32-33: BlockAlign
+        // Bytes 34-35: BitsPerSample
+        
+        const audioFormatCode = recordingBuffer.readUInt16LE(20);
+        channels = recordingBuffer.readUInt16LE(22);
+        sampleRate = recordingBuffer.readUInt32LE(24);
+        const byteRate = recordingBuffer.readUInt32LE(28);
+        const blockAlign = recordingBuffer.readUInt16LE(32);
+        bitsPerSample = recordingBuffer.readUInt16LE(34);
+        
+        // Map audio format codes
+        const formatMap = {
+          1: 'PCM',
+          6: 'mulaw (μ-law)',
+          7: 'alaw (A-law)',
+          17: 'ADPCM',
+        };
+        audioCodec = formatMap[audioFormatCode] || `Unknown (${audioFormatCode})`;
+        audioFormat = audioFormatCode;
+        
+        console.log('📊 WAV File Format Details:');
+        console.log(`   Audio Format: ${audioCodec} (code: ${audioFormatCode})`);
+        console.log(`   Channels: ${channels} (${channels === 1 ? 'mono' : channels === 2 ? 'stereo' : 'multi'})`);
+        console.log(`   Sample Rate: ${sampleRate} Hz`);
+        console.log(`   Bits Per Sample: ${bitsPerSample}`);
+        console.log(`   Byte Rate: ${byteRate} bytes/sec`);
+        console.log(`   Block Align: ${blockAlign} bytes`);
+        
+      } catch (parseError) {
+        console.warn('⚠️  Failed to parse WAV header:', parseError.message);
+        console.warn('   Will use fallback encoding options');
+      }
+    } else if (useWav) {
+      console.warn('⚠️  File does not appear to be a valid WAV file (missing RIFF header)');
+      console.warn(`   First 4 bytes: "${header}"`);
+      console.warn('   Will use fallback encoding options');
+    } else {
+      console.log('📊 MP3 format detected (no WAV header parsing)');
+      // MP3 format - Deepgram will auto-detect
+      channels = channels || 2; // Assume stereo for phone recordings
+      sampleRate = sampleRate || 8000; // Common phone sample rate
+    }
     
     // Initialize Deepgram client
     console.log('🔧 Initializing Deepgram client...');
@@ -347,14 +415,41 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
     
     // Prepare Deepgram options
     // Twilio records in stereo (2 channels): one for caller, one for callee
+    // Use parsed audio format info if available, otherwise use defaults
     const deepgramOptions = {
       model: 'nova-2', // Better for phone audio
       language: 'nl', // Dutch - explicitly set
       punctuate: true,
-      channels: 2, // Twilio sends stereo (2 channels)
+      channels: channels || 2, // Use parsed channels or default to 2
       multichannel: true, // Process both channels separately
-      // Let Deepgram auto-detect the format, but we're sending WAV
     };
+    
+    // Add explicit encoding options if we parsed the WAV header
+    if (audioFormat !== null && sampleRate !== null) {
+      if (audioFormat === 1) {
+        // PCM format - specify linear16 encoding
+        deepgramOptions.encoding = 'linear16';
+        deepgramOptions.sample_rate = sampleRate;
+        console.log(`   Using explicit encoding: linear16, sample_rate: ${sampleRate} Hz`);
+      } else if (audioFormat === 6) {
+        // mulaw format
+        deepgramOptions.encoding = 'mulaw';
+        deepgramOptions.sample_rate = sampleRate;
+        console.log(`   Using explicit encoding: mulaw, sample_rate: ${sampleRate} Hz`);
+      } else if (audioFormat === 7) {
+        // alaw format
+        deepgramOptions.encoding = 'alaw';
+        deepgramOptions.sample_rate = sampleRate;
+        console.log(`   Using explicit encoding: alaw, sample_rate: ${sampleRate} Hz`);
+      }
+    } else {
+      // Fallback: try common phone audio format (8kHz linear16)
+      console.log('   Using default encoding (auto-detect)');
+      // Try explicit options for phone audio
+      deepgramOptions.encoding = 'linear16';
+      deepgramOptions.sample_rate = 8000;
+      console.log(`   Fallback: encoding=linear16, sample_rate=8000 Hz`);
+    }
     
     console.log('📤 ========================================');
     console.log('📤 Sending recording to Deepgram for transcription...');
