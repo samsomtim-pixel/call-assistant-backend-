@@ -7,7 +7,6 @@ import http from 'http';
 import https from 'https';
 import { createClient } from '@deepgram/sdk';
 import { Readable } from 'stream';
-import https from 'https';
 
 dotenv.config();
 
