@@ -346,10 +346,13 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
     console.log('✅ Created readable stream from buffer');
     
     // Prepare Deepgram options
+    // Twilio records in stereo (2 channels): one for caller, one for callee
     const deepgramOptions = {
       model: 'nova-2', // Better for phone audio
       language: 'nl', // Dutch - explicitly set
       punctuate: true,
+      channels: 2, // Twilio sends stereo (2 channels)
+      multichannel: true, // Process both channels separately
       // Let Deepgram auto-detect the format, but we're sending WAV
     };
     
@@ -393,9 +396,11 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
       console.log(JSON.stringify(result, null, 2));
       console.log('📥 ========================================');
       
-      // Extract transcripts
+      // Extract transcripts from ALL channels
+      // Twilio stereo recordings have 2 channels: channel 0 = caller, channel 1 = callee
       const channels = result.results?.channels || [];
       console.log(`📊 Found ${channels.length} channel(s) in response`);
+      console.log(`   Expected 2 channels for stereo recording (caller + callee)`);
       
       if (channels.length === 0) {
         console.warn('⚠️  No channels found in Deepgram response!');
@@ -408,7 +413,8 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
       const transcripts = [];
       
       channels.forEach((channel, index) => {
-        console.log(`📊 Processing channel ${index}:`);
+        const channelLabel = index === 0 ? 'Caller' : index === 1 ? 'Callee' : `Channel ${index}`;
+        console.log(`📊 Processing ${channelLabel} (channel ${index}):`);
         const alternatives = channel.alternatives || [];
         console.log(`   Found ${alternatives.length} alternative(s)`);
         
@@ -426,16 +432,18 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
               words: alt.words || [],
               recordingSid: recordingSid,
               callSid: callSid,
+              channel: index, // Track which channel (0 = caller, 1 = callee)
+              speaker: channelLabel, // Human-readable label
               timestamp: new Date().toISOString(),
             };
             
             transcripts.push(transcriptEntry);
             
-            console.log(`📝 [TRANSCRIPT] "${alt.transcript}"`);
+            console.log(`📝 [TRANSCRIPT - ${channelLabel}] "${alt.transcript}"`);
             console.log(`   Confidence: ${(alt.confidence * 100).toFixed(1)}%`);
             console.log(`   Words: ${alt.words?.length || 0}`);
             
-            // Send transcript to frontend via WebSocket
+            // Send transcript to frontend via WebSocket with channel info
             broadcastTranscript({
               text: alt.transcript,
               confidence: alt.confidence || 0,
@@ -443,6 +451,8 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
               isFinal: true,
               recordingSid: recordingSid,
               callSid: callSid,
+              channel: index,
+              speaker: channelLabel,
             });
           } else {
             console.warn(`   ⚠️  Alternative ${altIndex} has no transcript!`);
