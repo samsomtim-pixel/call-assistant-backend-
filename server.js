@@ -713,6 +713,11 @@ const transcriptWss = new WebSocketServer({
 // Store connected frontend clients
 const frontendClients = new Set();
 
+// Simple in-memory array for transcripts (for polling fallback)
+// Stores last 10 transcripts with: text, speaker, confidence, timestamp, callSid
+const recentTranscripts = [];
+const MAX_TRANSCRIPTS = 10;
+
 transcriptWss.on('connection', (ws, req) => {
   const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   const connectionStartTime = Date.now();
@@ -774,6 +779,7 @@ transcriptWss.on('connection', (ws, req) => {
 });
 
 // Function to broadcast transcripts to all connected frontend clients
+// Also stores transcripts in memory for polling fallback
 const broadcastTranscript = (transcript) => {
   const message = JSON.stringify({
     type: 'transcript',
@@ -785,9 +791,28 @@ const broadcastTranscript = (transcript) => {
   console.log(`   Transcript text: "${transcript.text}"`);
   console.log(`   Confidence: ${(transcript.confidence * 100).toFixed(1)}%`);
   
+  // Store transcript in memory for polling fallback (simple array, keep last 10)
+  const transcriptEntry = {
+    text: transcript.text,
+    speaker: transcript.speaker || 'unknown',
+    confidence: transcript.confidence || 0,
+    timestamp: new Date().toISOString(),
+    callSid: transcript.callSid || 'unknown'
+  };
+  
+  recentTranscripts.push(transcriptEntry);
+  
+  // Keep only last MAX_TRANSCRIPTS
+  if (recentTranscripts.length > MAX_TRANSCRIPTS) {
+    recentTranscripts.shift(); // Remove oldest
+  }
+  
+  console.log(`   💾 Stored transcript (total in memory: ${recentTranscripts.length}/${MAX_TRANSCRIPTS})`);
+  
+  // Try WebSocket first (real-time)
   if (frontendClients.size === 0) {
-    console.warn('⚠️  WARNING: No frontend clients connected! Transcript will not be displayed.');
-    console.warn('   Make sure frontend is running and WebSocket connection is established.');
+    console.warn('⚠️  WARNING: No frontend clients connected via WebSocket!');
+    console.warn('   Transcript stored in memory - frontend can poll /api/latest-transcript');
   }
   
   let sentCount = 0;
@@ -796,7 +821,7 @@ const broadcastTranscript = (transcript) => {
       try {
         client.send(message);
         sentCount++;
-        console.log(`   ✅ Sent to frontend client #${sentCount}`);
+        console.log(`   ✅ Sent to frontend client #${sentCount} via WebSocket`);
       } catch (error) {
         console.error('❌ Error sending transcript to frontend:', error);
         frontendClients.delete(client);
@@ -808,7 +833,8 @@ const broadcastTranscript = (transcript) => {
     }
   });
   
-  console.log(`📊 Transcript broadcast complete: ${sentCount}/${frontendClients.size} clients received`);
+  console.log(`📊 Transcript broadcast complete: ${sentCount}/${frontendClients.size} clients received via WebSocket`);
+  console.log(`   📋 Transcript also available via GET /api/latest-transcript?callSid=${callSid}`);
 };
 
 wss.on('connection', (ws, req) => {
@@ -1268,6 +1294,45 @@ wss.on('connection', (ws, req) => {
  */
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+/**
+ * Get latest transcript (polling fallback)
+ * Returns the most recent transcript from the in-memory array
+ * Simple endpoint - no query params needed
+ */
+app.get('/api/latest-transcript', (req, res) => {
+  try {
+    console.log(`📋 Polling request for latest transcript`);
+    console.log(`   Total transcripts in memory: ${recentTranscripts.length}`);
+    
+    if (recentTranscripts.length === 0) {
+      console.log(`   No transcripts available`);
+      return res.json({
+        transcript: null,
+        message: 'No transcripts available yet'
+      });
+    }
+    
+    // Get most recent transcript (last in array)
+    const latestTranscript = recentTranscripts[recentTranscripts.length - 1];
+    
+    console.log(`   Returning latest transcript:`);
+    console.log(`     Text: "${latestTranscript.text}"`);
+    console.log(`     Speaker: ${latestTranscript.speaker}`);
+    console.log(`     Call SID: ${latestTranscript.callSid}`);
+    
+    res.json({
+      transcript: latestTranscript,
+      message: 'Latest transcript retrieved successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error in /api/latest-transcript:', error);
+    res.status(500).json({ 
+      error: 'Failed to retrieve transcript',
+      details: error.message 
+    });
+  }
 });
 
 /**
