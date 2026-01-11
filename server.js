@@ -247,7 +247,7 @@ app.get('/api/voice', (req, res) => {
   res.type('text/xml');
   const twiml = new twilio.twiml.VoiceResponse();
   twiml.say('This endpoint requires a POST request. Twilio will use POST when making calls.');
-  res.send(twiml.toString());
+    res.send(twiml.toString());
 });
 
 /**
@@ -459,29 +459,114 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
     console.log(`   Stream type: ${audioStream.constructor.name}`);
     
     const startTime = Date.now();
-    const { result, error } = await deepgramClient.listen.prerecorded.transcribeFile(
-      audioStream,
-      deepgramOptions
-    ).catch(err => {
-      console.error('❌ Deepgram API promise rejection:', err);
+    const DEEPGRAM_TIMEOUT_MS = 30000; // 30 seconds timeout
+    
+    // Create a timeout promise
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`Deepgram API call timed out after ${DEEPGRAM_TIMEOUT_MS / 1000} seconds`));
+      }, DEEPGRAM_TIMEOUT_MS);
+    });
+    
+    let result = null;
+    let error = null;
+    
+    // Wrap Deepgram API call with timeout and better error handling
+    try {
+      console.log(`⏱️  Starting Deepgram API call (timeout: ${DEEPGRAM_TIMEOUT_MS / 1000}s)...`);
+      
+      const deepgramPromise = deepgramClient.listen.prerecorded.transcribeFile(
+        audioStream,
+        deepgramOptions
+      );
+      
+      // Race between Deepgram call and timeout
+      const response = await Promise.race([deepgramPromise, timeoutPromise]);
+      
+      // Deepgram transcribeFile returns an object with { result, error } structure
+      // Extract result and error from the response
+      if (response && typeof response === 'object') {
+        // Check if response has result/error properties (Deepgram format)
+        if ('result' in response || 'error' in response) {
+          result = response.result || null;
+          error = response.error || null;
+        } else {
+          // If response doesn't have result/error, assume it's the result directly
+          result = response;
+          error = null;
+        }
+      } else {
+        result = response;
+        error = null;
+      }
+      
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+      console.log(`✅ Deepgram API call completed in ${duration}s`);
+      
+    } catch (err) {
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+      console.error('❌ ========================================');
+      console.error('❌ Deepgram API call failed after', duration, 'seconds');
       console.error('   Error type:', err?.constructor?.name);
       console.error('   Error message:', err?.message);
       console.error('   Error code:', err?.code);
-      console.error('   Full error object:', JSON.stringify(err, null, 2));
-      return { result: null, error: err };
-    });
-    
-    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-    console.log(`⏱️  Deepgram API call completed in ${duration}s`);
+      console.error('   Error stack:', err?.stack);
+      
+      // Try to extract more error details
+      if (err?.response) {
+        console.error('   Response status:', err.response?.status);
+        console.error('   Response data:', JSON.stringify(err.response?.data, null, 2));
+      }
+      
+      console.error('   Full error object:', JSON.stringify(err, Object.getOwnPropertyNames(err), 2));
+      
+      error = err;
+      result = null;
+    }
     
     if (error) {
       console.error('❌ ========================================');
-      console.error('❌ Deepgram transcription error:');
+      console.error('❌ Deepgram transcription error detected:');
       console.error('   Error type:', error?.constructor?.name);
       console.error('   Error code:', error?.code);
       console.error('   Error message:', error?.message);
-      console.error('   Full error object:', JSON.stringify(error, null, 2));
-      return;
+      console.error('   Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+      
+      // Store error transcript in memory array
+      console.log('💾 Storing error transcript in memory array...');
+      const errorTranscript = {
+        text: `[Transcription Error: ${error.message || 'Unknown error'}]`,
+        speaker: 'system',
+        confidence: 0,
+        timestamp: new Date().toISOString(),
+        callSid: callSid || 'unknown',
+        error: true,
+        errorMessage: error.message
+      };
+      
+      recentTranscripts.push(errorTranscript);
+      if (recentTranscripts.length > MAX_TRANSCRIPTS) {
+        recentTranscripts.shift();
+      }
+      console.log(`   ✅ Stored error transcript (total in memory: ${recentTranscripts.length}/${MAX_TRANSCRIPTS})`);
+      
+      // Also try to broadcast error via WebSocket
+      try {
+        broadcastTranscript({
+          text: `[Transcription failed: ${error.message || 'Unknown error'}]`,
+          confidence: 0,
+          speaker: 'system',
+          callSid: callSid,
+          isFinal: true,
+          error: true
+        });
+        console.log('   ✅ Broadcast error message via WebSocket');
+      } catch (broadcastError) {
+        console.error('   ❌ Failed to broadcast error:', broadcastError.message);
+      }
+      
+      // Don't return - continue to see if we can extract any partial results
+      console.log('⚠️  Continuing despite error to check for partial results...');
     }
     
     if (result) {
@@ -557,11 +642,44 @@ async function processRecording(recordingUrl, recordingSid, callSid) {
       });
       
       console.log(`✅ Transcription complete: ${transcripts.length} transcript(s) extracted`);
+      console.log(`💾 All transcripts have been stored in memory array (via broadcastTranscript)`);
       console.log('🔄 ========================================');
       return transcripts;
     } else {
       console.warn('⚠️  Deepgram returned no result (result is null/undefined)');
       console.warn('   This might indicate an issue with the API call');
+      console.warn('   No transcripts will be stored from this call');
+      
+      // Store a placeholder transcript indicating no results
+      const noResultTranscript = {
+        text: '[No transcription available - Deepgram returned no result]',
+        speaker: 'system',
+        confidence: 0,
+        timestamp: new Date().toISOString(),
+        callSid: callSid || 'unknown',
+        error: true,
+        errorMessage: 'Deepgram returned no result'
+      };
+      
+      recentTranscripts.push(noResultTranscript);
+      if (recentTranscripts.length > MAX_TRANSCRIPTS) {
+        recentTranscripts.shift();
+      }
+      console.log(`   💾 Stored 'no result' transcript (total in memory: ${recentTranscripts.length}/${MAX_TRANSCRIPTS})`);
+      
+      try {
+        broadcastTranscript({
+          text: '[No transcription available - Deepgram returned no result]',
+          confidence: 0,
+          speaker: 'system',
+          callSid: callSid,
+          isFinal: true,
+          error: true
+        });
+        console.log('   ✅ Broadcasted no-result message via WebSocket');
+      } catch (broadcastError) {
+        console.error('   ❌ Failed to broadcast no-result message:', broadcastError.message);
+      }
     }
   } catch (error) {
     console.error('❌ ========================================');
@@ -1033,6 +1151,8 @@ wss.on('connection', (ws, req) => {
                 confidence: alt.confidence || 0,
                 words: alt.words || [],
                 isFinal: true,
+                callSid: callSid || 'unknown',
+                speaker: 'unknown',
               });
             }
           });
